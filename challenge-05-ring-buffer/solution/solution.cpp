@@ -7,31 +7,33 @@ namespace hftu {
     }
 
     bool RingBuffer::push(const Message &msg) {
-        if (head_ == cached_tail_ + capacity_) {
-            cached_tail_ = tail_.load(std::memory_order::seq_cst);
-            if (head_ == cached_tail_ + capacity_) {
+        size_t head = head_.load(std::memory_order::relaxed);
+        if (head == cached_tail_ + capacity_) {
+            cached_tail_ = tail_.load(std::memory_order::acquire);
+            if (head == cached_tail_ + capacity_) {
                 return false;
             }
         }
-        buf_[head_ & kMask] = msg;
-        head_ = head_ + 1;
+        buf_[head & kMask] = msg;
+        head_.store(head + 1, std::memory_order_release);
         return true;
     }
 
     bool RingBuffer::pop(Message &out) {
-        if (tail_ == cached_head_) {
-            cached_head_ = head_.load(std::memory_order::seq_cst);
-            if (tail_ == cached_head_) {
+        size_t tail = tail_.load(std::memory_order::relaxed);
+        if (tail == cached_head_) {
+            cached_head_ = head_.load(std::memory_order::acquire);
+            if (tail == cached_head_) {
                 return false;
             }
         }
-        out = buf_[tail_ & kMask];
-        tail_ = tail_ + 1;
+        out = buf_[tail & kMask];
+        tail_.store(tail + 1, std::memory_order_release);
         return true;
     }
 
     size_t RingBuffer::size() const {
-        return head_ - tail_;
+        return head_.load(std::memory_order::relaxed) - tail_.load(std::memory_order::relaxed);
     }
 } // namespace hftu
 // int main() {

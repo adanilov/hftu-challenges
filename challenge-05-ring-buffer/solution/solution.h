@@ -44,10 +44,12 @@ private:
     std::vector<Message> buf_;
     size_t capacity_;
     alignas(128) std::atomic<size_t> head_ = 0;
-    std::atomic<size_t> cached_tail_ = 0;
+    // std::atomic<size_t> cached_tail_ = 0;
+    size_t cached_tail_ = 0;
 
     alignas(128) std::atomic<size_t> tail_ = 0;
-    std::atomic<size_t> cached_head_ = 0;
+    // std::atomic<size_t> cached_head_ = 0;
+    size_t cached_head_ = 0;
     int kMask;
 };
 
