@@ -1,9 +1,87 @@
-// Challenge 09: FIX Parser — Skeleton Implementation
-// This is a correct but slow reference. You can do MUCH better!
+// Challenge 09: FIX Parser
+//
+// Hot path design:
+//   * Message framing is arithmetic, not scanning: tag 9 (BodyLength) plus the
+//     fixed 7-byte "10=NNN<SOH>" checksum field give the exact message extent,
+//     so we never scan for message boundaries.
+//   * One fused SIMD pass over the checksum region does BOTH jobs from the same
+//     16-byte loads: it accumulates the checksum (sum of all bytes) and finds
+//     every SOH (field boundary). No byte is scanned twice.
+//   * Fields are dispatched by an SOH-anchored 3-gram: the 3 bytes "dd=" at a
+//     field start uniquely identify a 2-digit tag (anchoring on the SOH avoids
+//     the 10-vs-100 substring ambiguity). Filler fields never match, so their
+//     bytes cost only the (already-free) checksum add — no per-field parsing.
 
 #include "solution.h"
 
+#include <cstring>   // memcpy
+
+#if defined(FIX_FORCE_SCALAR)
+  // no SIMD
+#elif defined(__aarch64__)
+  #include <arm_neon.h>
+  #define FIX_SIMD_NEON 1
+#elif defined(__SSE2__)
+  #include <emmintrin.h>
+  #define FIX_SIMD_SSE2 1
+#endif
+
 namespace hftu {
+
+// Scan [begin, end): return sum of all bytes (pre-mod checksum) and append the
+// offset (relative to begin) of the byte AFTER each SOH — i.e. each field start
+// — to starts[]. begin itself (the first field) is added by the caller.
+// Returns the number of starts written.
+static int scan_region(const char* begin, const char* end,
+                       const char** starts, unsigned& csum_out) {
+    unsigned csum = 0;
+    int n = 0;
+    const char* p = begin;
+
+#if defined(FIX_SIMD_NEON)
+    const uint8x16_t soh = vdupq_n_u8(0x01);
+    // Per-byte bit selector to turn a 0x00/0xFF compare mask into a 16-bit mask.
+    const uint8x16_t bits = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
+    for (; p + 16 <= end; p += 16) {
+        uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+        csum += vaddlvq_u8(v);                       // widening sum of 16 bytes
+        uint8x16_t cmp = vceqq_u8(v, soh);
+        uint8x16_t sel = vandq_u8(cmp, bits);
+        unsigned m = vaddv_u8(vget_low_u8(sel)) | (vaddv_u8(vget_high_u8(sel)) << 8);
+        while (m) {
+            int b = __builtin_ctz(m);
+            starts[n++] = p + b + 1;
+            m &= m - 1;
+        }
+    }
+#elif defined(FIX_SIMD_SSE2)
+    const __m128i soh  = _mm_set1_epi8(0x01);
+    const __m128i zero = _mm_setzero_si128();
+    for (; p + 16 <= end; p += 16) {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+        __m128i sad = _mm_sad_epu8(v, zero);         // two 64-bit partial sums
+        csum += static_cast<unsigned>(_mm_cvtsi128_si32(sad))
+              + static_cast<unsigned>(_mm_extract_epi16(sad, 4));
+        unsigned m = static_cast<unsigned>(
+            _mm_movemask_epi8(_mm_cmpeq_epi8(v, soh)));
+        while (m) {
+            int b = __builtin_ctz(m);
+            starts[n++] = p + b + 1;
+            m &= m - 1;
+        }
+    }
+#endif
+
+    // Scalar tail (and the whole region on non-SIMD builds).
+    for (; p < end; ++p) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        csum += c;
+        if (c == 0x01) starts[n++] = p + 1;
+    }
+
+    csum_out = csum;
+    return n;
+}
 
 FixParser::FixParser() {}
 
@@ -108,70 +186,69 @@ static int64_t parse_timestamp(std::string_view s) {
     return total_secs * 1'000'000'000LL + nanos;
 }
 
+// SOH-anchored 3-gram of a 2-digit tag: bytes "d d =" packed little-endian.
+static constexpr uint32_t sig3(char a, char b) {
+    return static_cast<uint32_t>(static_cast<unsigned char>(a))
+         | (static_cast<uint32_t>(static_cast<unsigned char>(b)) << 8)
+         | (static_cast<uint32_t>(static_cast<unsigned char>('=')) << 16);
+}
+
 void FixParser::parse_batch(std::string_view data, std::vector<ParsedOrder>& out) {
     const char* const end = data.data() + data.size();
     const char* p = data.data();
 
+    constexpr uint32_t SIG_35 = sig3('3','5');   // MsgType
+    constexpr uint32_t SIG_52 = sig3('5','2');   // SendingTime
+    constexpr uint32_t SIG_55 = sig3('5','5');   // Symbol
+    constexpr uint32_t SIG_44 = sig3('4','4');   // Price
+    constexpr uint32_t SIG_38 = sig3('3','8');   // OrderQty
+    constexpr uint32_t SIG_54 = sig3('5','4');   // Side
+
     while (p < end) {
+        // --- Frame the message by arithmetic (tags 8 and 9), no scanning. ---
+        // Tag 8 (BeginString) is first: skip to its SOH.
+        const char* soh8 = static_cast<const char*>(
+            memchr(p, 0x01, static_cast<size_t>(end - p)));
+        if (!soh8) break;
+        // Tag 9 (BodyLength) is second: "9=<N>". Read N.
+        const char* np = soh8 + 3;                 // skip SOH + "9="
+        unsigned N = 0;
+        while (*np != 0x01) { N = N * 10 + static_cast<unsigned>(*np - '0'); ++np; }
+        const char* const header_end = np + 1;     // first body field
+        const char* const tag10_start = header_end + N;   // "10=NNN<SOH>"
+
+        // --- One fused SIMD pass: checksum + every field boundary (SOH). ---
+        const char* starts[512];
+        starts[0] = p;                             // first field (tag 8)
+        unsigned csum = 0;
+        int ns = 1 + scan_region(p, tag10_start, starts + 1, csum);
+
+        // --- Dispatch the 6 fields we care about via 3-gram signature. ---
         ParsedOrder order{};
-        unsigned running_cs = 0;   // sum of every byte seen in this message
-        bool msg_complete = false;
+        for (int k = 0; k + 1 < ns; ++k) {
+            const char* s = starts[k];
+            const char* e = starts[k + 1] - 1;     // SOH terminating this field
+            uint32_t sig;
+            std::memcpy(&sig, s, 4);
+            sig &= 0x00FFFFFFu;                    // low 3 bytes = "dd="
+            const std::string_view value(s + 3, static_cast<size_t>(e - (s + 3)));
 
-        // One linear pass over the message. Each iteration consumes exactly
-        // one "tag=value<SOH>" field and folds its bytes into running_cs, so
-        // the checksum falls out for free — no second pass over the bytes.
-        while (p < end) {
-            const unsigned cs_before_field = running_cs;  // checksum excludes tag-10 field
-
-            // --- tag: digits up to '=' (FIX tags are always numeric) ---
-            unsigned tag = 0;
-            char c;
-            while (p < end && (c = *p) != '=') {
-                running_cs += static_cast<unsigned char>(c);
-                tag = tag * 10 + static_cast<unsigned>(c - '0');
-                ++p;
-            }
-            if (p == end) break;                       // truncated field
-            running_cs += static_cast<unsigned char>('=');
-            ++p;                                       // skip '='
-
-            // --- value: bytes up to SOH ---
-            // Hottest loop in the parser (runs over every value byte). Well-formed
-            // FIX guarantees an SOH terminator before end-of-buffer, so we trust
-            // that sentinel and drop the redundant `p < end` bounds check — one
-            // fewer branch per byte. (Outer and tag loops stay bounded.)
-            const char* val_start = p;
-            while ((c = *p) != '\x01') {
-                running_cs += static_cast<unsigned char>(c);
-                ++p;
-            }
-            std::string_view value(val_start, static_cast<size_t>(p - val_start));
-            running_cs += static_cast<unsigned char>('\x01');
-            ++p;                                       // consume SOH
-
-            if (tag == 10) {
-                // Expected checksum is this field's value; actual is the sum of
-                // everything before the "10=" field started.
-                unsigned expected = 0;
-                for (char d : value) expected = expected * 10 + static_cast<unsigned>(d - '0');
-                order.valid = ((cs_before_field & 0xFFu) == expected);
-                msg_complete = true;
-                break;
-            }
-
-            switch (tag) {
-                case 35: if (!value.empty()) order.msg_type = value[0]; break;
-                case 54: if (!value.empty()) order.side = static_cast<int8_t>(value[0] - '0'); break;
-                case 55: lookup(value, order.symbol_id); break;
-                case 52: order.timestamp = parse_timestamp(value); break;
-                case 44: order.price = parse_price(value); break;
-                case 38: order.quantity = parse_int(value); break;
-                default: break;
-            }
+            if      (sig == SIG_55) lookup(value, order.symbol_id);
+            else if (sig == SIG_44) order.price = parse_price(value);
+            else if (sig == SIG_38) order.quantity = parse_int(value);
+            else if (sig == SIG_52) order.timestamp = parse_timestamp(value);
+            else if (sig == SIG_35) order.msg_type = s[3];
+            else if (sig == SIG_54) order.side = static_cast<int8_t>(s[3] - '0');
         }
 
-        if (!msg_complete) break;   // no more complete messages
+        // --- Checksum: "10=NNN" is 3 zero-padded digits. ---
+        const unsigned expected = static_cast<unsigned>(tag10_start[3] - '0') * 100u
+                                + static_cast<unsigned>(tag10_start[4] - '0') * 10u
+                                + static_cast<unsigned>(tag10_start[5] - '0');
+        order.valid = ((csum & 0xFFu) == expected);
+
         out.push_back(order);
+        p = tag10_start + 7;                       // "10=" + 3 digits + SOH
     }
 }
 
