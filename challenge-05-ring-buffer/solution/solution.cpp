@@ -8,7 +8,7 @@ namespace hftu {
 
     bool RingBuffer::push(const Message &msg) {
         size_t head = head_.load(std::memory_order::relaxed);
-        if (head == cached_tail_ + capacity_) {
+        if (head == cached_tail_ + capacity_) [[unlikely]] {   // full: rare in a balanced queue
             cached_tail_ = tail_.load(std::memory_order::acquire);
             if (head == cached_tail_ + capacity_) {
                 return false;
@@ -21,7 +21,7 @@ namespace hftu {
 
     bool RingBuffer::pop(Message &out) {
         size_t tail = tail_.load(std::memory_order::relaxed);
-        if (tail == cached_head_) {
+        if (tail == cached_head_) [[unlikely]] {   // empty: rare in a balanced queue
             cached_head_ = head_.load(std::memory_order::acquire);
             if (tail == cached_head_) {
                 return false;
