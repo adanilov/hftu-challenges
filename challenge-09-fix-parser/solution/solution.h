@@ -38,21 +38,31 @@ public:
     void parse_batch(std::string_view data, std::vector<ParsedOrder>& out);
 
 private:
-    // Flat open-addressed (linear-probe) symbol table. Contiguous storage and
-    // mask-indexing beat a node-based unordered_map: no per-lookup pointer
-    // chase / cache miss, and short symbols live inline via std::string SSO.
+    // Fast path: symbols <= 8 bytes are packed into a uint64 key. Lookup is then
+    // an 8-byte load + mask, an integer hash, and integer key compares against a
+    // compact 16-byte-per-slot open-addressed table — no byte-loop hashing and
+    // no string compare. Symbols longer than 8 bytes (rare) use a linear fallback.
     struct Slot {
-        std::string key;
-        uint32_t    val = 0;
-        bool        used = false;
+        uint64_t key = 0;
+        uint32_t val = 0;
+        uint32_t used = 0;
     };
-    std::vector<Slot> slots_;
-    size_t            mask_ = 0;
+    std::vector<Slot>                        fast_;
+    size_t                                   fast_mask_ = 0;
+    std::vector<std::pair<std::string, uint32_t>> long_;   // symbols > 8 bytes
 
-    static size_t hash_sv(std::string_view s) {
-        uint64_t h = 1469598103934665603ULL;   // FNV-1a: cheap, good on short keys
-        for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
-        return static_cast<size_t>(h);
+    // Pack up to 8 bytes little-endian (byte i -> bits [8i, 8i+8)).
+    static uint64_t pack8(const char* p, size_t len) {
+        uint64_t k = 0;
+        for (size_t i = 0; i < len; ++i)
+            k |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (8 * i);
+        return k;
+    }
+    static uint64_t hash64(uint64_t k) {       // murmur3 finalizer: mixes into low bits
+        k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
+        k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
+        k ^= k >> 33;
+        return k;
     }
     // Returns true and sets out on hit; leaves out untouched on miss.
     bool lookup(std::string_view s, uint32_t& out) const;
