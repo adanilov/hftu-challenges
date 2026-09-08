@@ -1,35 +1,37 @@
 #pragma once
-// Challenge 08: Ticker Lookup
+// Challenge 06: Seqlock
 // Edit this file and solution.cpp to implement your solution.
 //
-// You receive all keys once via build(), then only find() is called.
-// build() is NOT timed — spend as long as you want preprocessing.
+// A seqlock allows one writer and multiple readers to share data
+// without blocking. Readers retry if they detect a concurrent write.
+// No mutexes allowed in your final solution — this is a lock-free exercise.
 
+#include <atomic>
 #include <cstdint>
-#include <cstddef>
-#include <string>
-#include <unordered_map>
+#include <mutex>
 
 namespace hftu {
 
-struct TickerEntry {
-    const char* symbol;    // null-terminated, max 6 chars
-    size_t symbol_len;
-    uint32_t value;
-};
+    struct Payload {
+        int64_t a;
+        int64_t b;
+        int64_t c;
+        int64_t d;
+    };
 
-class TickerLookup {
-public:
-    TickerLookup();
+    class Seqlock {
+    public:
+        Seqlock();
 
-    // Receive all entries at once. Called exactly once. NOT timed.
-    void build(const TickerEntry* entries, size_t count);
+        // Update the protected payload.
+        void write(const Payload& data);
 
-    // Look up a symbol. Returns pointer to value, or nullptr if not found.
-    const uint32_t* find(const char* symbol, size_t symbol_len) const;
+        // Read the payload. Must never return a torn value.
+        Payload read() const;
 
-private:
-    std::unordered_map<std::string, uint32_t> map_;
-};
+    private:
+        Payload data_{};
+        std::atomic<uint32_t> seq_{0};
+    };
 
 } // namespace hftu

@@ -1,25 +1,30 @@
-// Challenge 08: Ticker Lookup — Skeleton Implementation
-// This is a correct but slow std::unordered_map reference. You can do MUCH better!
-// Since build() is not timed, you could build a perfect hash, a trie, or any
-// precomputed structure.
+// Challenge 06: Seqlock — Skeleton Implementation
+// This is a correct but slow mutex-based reference. You can do MUCH better!
+// The real seqlock uses a sequence counter and memory fences — no mutexes.
 
 #include "solution.h"
 
 namespace hftu {
-
-TickerLookup::TickerLookup() {}
-
-void TickerLookup::build(const TickerEntry* entries, size_t count) {
-    map_.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        map_.emplace(std::string(entries[i].symbol, entries[i].symbol_len), entries[i].value);
+    Seqlock::Seqlock() {
     }
-}
 
-const uint32_t* TickerLookup::find(const char* symbol, size_t symbol_len) const {
-    auto it = map_.find(std::string(symbol, symbol_len));
-    if (it == map_.end()) return nullptr;
-    return &it->second;
-}
+    void Seqlock::write(const Payload &data) {
+        uint32_t s = seq_.load(std::memory_order_relaxed);
+        seq_.store(s + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        data_ = data;
+        seq_.store(s + 2, std::memory_order_release);
+    }
 
+    Payload Seqlock::read() const {
+        Payload out;
+        uint32_t s0, s1;
+        do {
+            s0 = seq_.load(std::memory_order_acquire);
+            out = data_;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            s1 = seq_.load(std::memory_order_relaxed);
+        } while (s0 != s1 || (s0 & 1));
+        return out;
+    }
 } // namespace hftu

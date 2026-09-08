@@ -20,6 +20,8 @@ namespace hftu {
     };
 
     class Seqlock {
+        alignas(64) std::atomic<uint32_t> seq_{0};
+        Payload data_{};
     public:
         Seqlock();
 
@@ -28,10 +30,6 @@ namespace hftu {
 
         // Read the payload. Must never return a torn value.
         Payload read() const;
-
-    private:
-        Payload data_{};
-        std::atomic<uint32_t> seq_{0};
     };
 
 } // namespace hftu
