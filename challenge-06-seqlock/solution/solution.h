@@ -20,7 +20,8 @@ namespace hftu {
     };
 
     class Seqlock {
-        alignas(64) std::atomic<uint32_t> seq_{0};
+        alignas(128)
+        std::atomic<uint32_t> seq_{0};
         Payload data_{};
     public:
         Seqlock();
