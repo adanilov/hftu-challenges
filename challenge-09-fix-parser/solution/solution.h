@@ -26,6 +26,17 @@ struct ParsedOrder {
     bool     valid;       // false if checksum failed
 };
 
+// Transparent hash/eq so we can find() by std::string_view without
+// constructing a std::string key (no per-lookup allocation).
+struct SvHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
+};
+struct SvEq {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const { return a == b; }
+};
+
 class FixParser {
 public:
     FixParser();
@@ -39,7 +50,7 @@ public:
     void parse_batch(std::string_view data, std::vector<ParsedOrder>& out);
 
 private:
-    std::unordered_map<std::string, uint32_t> symbol_map_;
+    std::unordered_map<std::string, uint32_t, SvHash, SvEq> symbol_map_;
 };
 
 } // namespace hftu

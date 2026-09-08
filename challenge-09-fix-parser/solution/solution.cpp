@@ -101,48 +101,47 @@ void FixParser::parse_batch(std::string_view data, std::vector<ParsedOrder>& out
     size_t pos = 0;
 
     while (pos < data.size()) {
-        // Find tag 10= (always last tag)
-        auto tag10 = data.find("10=", pos);
-        if (tag10 == std::string_view::npos) break;
-
-        auto msg_end = data.find('\x01', tag10);
-        if (msg_end == std::string_view::npos) break;
-        ++msg_end;
-
-        std::string_view msg = data.substr(pos, msg_end - pos);
+        size_t msg_start = pos;
         ParsedOrder order{};
 
-        // Checksum: sum of all bytes before "10=" mod 256
-        std::string_view cs_str = msg.substr(tag10 - pos + 3, msg_end - tag10 - 4);
-        int expected_cs = 0;
-        for (char c : cs_str) {
-            if (c >= '0' && c <= '9') expected_cs = expected_cs * 10 + (c - '0');
-        }
-        int actual_cs = compute_checksum(msg.data(), tag10 - pos);
-        order.valid = (actual_cs == expected_cs);
-
-        // Scan tags
-        size_t tpos = 0;
-        while (tpos < msg.size()) {
-            auto eq = msg.find('=', tpos);
+        // Single forward pass over this message's tags. Tag 10 (checksum) is
+        // always last and marks the end of the message.
+        size_t tpos = pos;
+        bool msg_complete = false;
+        while (tpos < data.size()) {
+            auto eq = data.find('=', tpos);
             if (eq == std::string_view::npos) break;
-            auto soh = msg.find('\x01', eq);
-            if (soh == std::string_view::npos) soh = msg.size();
+            auto soh = data.find('\x01', eq);
+            if (soh == std::string_view::npos) soh = data.size();
 
             // Parse tag number
             int tag = 0;
             for (size_t i = tpos; i < eq; ++i) {
-                char c = msg[i];
+                char c = data[i];
                 if (c >= '0' && c <= '9') tag = tag * 10 + (c - '0');
             }
 
-            std::string_view value = msg.substr(eq + 1, soh - eq - 1);
+            std::string_view value = data.substr(eq + 1, soh - eq - 1);
+
+            if (tag == 10) {
+                // Checksum field: value is the expected checksum; sum of all
+                // bytes before this field ("10=") is the actual checksum.
+                int expected_cs = 0;
+                for (char c : value) {
+                    if (c >= '0' && c <= '9') expected_cs = expected_cs * 10 + (c - '0');
+                }
+                int actual_cs = compute_checksum(data.data() + msg_start, tpos - msg_start);
+                order.valid = (actual_cs == expected_cs);
+                tpos = soh + 1;
+                msg_complete = true;
+                break;
+            }
 
             switch (tag) {
                 case 35: if (!value.empty()) order.msg_type = value[0]; break;
                 case 54: if (!value.empty()) order.side = static_cast<int8_t>(value[0] - '0'); break;
                 case 55: {
-                    auto it = symbol_map_.find(std::string(value));
+                    auto it = symbol_map_.find(value);
                     if (it != symbol_map_.end()) order.symbol_id = it->second;
                     break;
                 }
@@ -155,8 +154,9 @@ void FixParser::parse_batch(std::string_view data, std::vector<ParsedOrder>& out
             tpos = soh + 1;
         }
 
+        if (!msg_complete) break;   // no more complete messages
         out.push_back(order);
-        pos = msg_end;
+        pos = tpos;
     }
 }
 
