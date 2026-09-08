@@ -40,10 +40,7 @@ namespace hftu {
             uint32_t s = seq_.load(std::memory_order_relaxed);
             seq_.store(s + 1, std::memory_order_relaxed);   // -> odd: write in progress
             std::atomic_thread_fence(std::memory_order_release);
-            data_.a = data.a;
-            data_.b = data.b;
-            data_.c = data.c;
-            data_.d = data.d;
+            data_ = data;                                    // whole-struct copy -> ldp/stp
             seq_.store(s + 2, std::memory_order_release);    // -> even: publish
         }
 
