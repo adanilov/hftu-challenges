@@ -31,7 +31,9 @@ namespace hftu {
 
     private:
         Payload data_{};
-        std::atomic<uint32_t> seq_{0};
+        mutable std::mutex mtx_;
+
+        std::atomic<uint32_t> seq_{0}; // чёт = покой, нечет = запись
     };
 
 } // namespace hftu
