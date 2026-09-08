@@ -29,25 +29,54 @@ struct Message {
 class RingBuffer {
 public:
     // Capacity is always a power of 2.
-    explicit RingBuffer(size_t capacity);
+    // Defined inline in the header so push/pop inline into the caller's hot loop
+    // (Ch 15): no call/ret per op, indices kept in registers, loop fused.
+    explicit RingBuffer(size_t capacity)
+        : buf_(capacity), capacity_(capacity) {
+        kMask = capacity_ - 1;
+    }
 
     // Push a message (producer thread). Returns false if full.
-    bool push(const Message& msg);
+    inline bool push(const Message& msg) {
+        size_t head = head_.load(std::memory_order::relaxed);
+        if (head == cached_tail_ + capacity_) {
+            cached_tail_ = tail_.load(std::memory_order::acquire);
+            if (head == cached_tail_ + capacity_) {
+                return false;
+            }
+        }
+        buf_[head & kMask] = msg;
+        head_.store(head + 1, std::memory_order_release);
+        return true;
+    }
 
     // Pop a message into out (consumer thread). Returns false if empty.
-    bool pop(Message& out);
+    inline bool pop(Message& out) {
+        size_t tail = tail_.load(std::memory_order::relaxed);
+        if (tail == cached_head_) {
+            cached_head_ = head_.load(std::memory_order::acquire);
+            if (tail == cached_head_) {
+                return false;
+            }
+        }
+        out = buf_[tail & kMask];
+        tail_.store(tail + 1, std::memory_order_release);
+        return true;
+    }
 
     // Number of elements currently stored.
-    size_t size() const;
+    inline size_t size() const {
+        return head_.load(std::memory_order::relaxed) - tail_.load(std::memory_order::relaxed);
+    }
 
 private:
     std::vector<Message> buf_;
     size_t capacity_;
-    alignas(128) std::atomic<size_t> head_ = 0;
+    alignas(64) std::atomic<size_t> head_ = 0;
     // std::atomic<size_t> cached_tail_ = 0;
     size_t cached_tail_ = 0;
 
-    alignas(128) std::atomic<size_t> tail_ = 0;
+    alignas(64) std::atomic<size_t> tail_ = 0;
     // std::atomic<size_t> cached_head_ = 0;
     size_t cached_head_ = 0;
     int kMask;
