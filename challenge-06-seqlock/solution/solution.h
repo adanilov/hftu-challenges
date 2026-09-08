@@ -12,12 +12,11 @@
 #include <atomic>
 #include <cstdint>
 
-#if defined(__x86_64__) || defined(_M_X64)
-  #include <immintrin.h>
-  #define HFTU_CPU_RELAX() _mm_pause()   // helps under contention on x86
-#else
-  #define HFTU_CPU_RELAX() ((void)0)     // measured net-negative on Apple Silicon
-#endif
+// A/B variant B: no CPU pause on the retry path. On isolated separate physical
+// cores (HFT-typical) there is no SMT sibling to yield to, so a pause (~140 cyc
+// on Skylake+) only adds retry latency. Testing whether removing it wins on the
+// x86 grader vs variant A (_mm_pause on retry).
+#define HFTU_CPU_RELAX() ((void)0)
 
 namespace hftu {
 
