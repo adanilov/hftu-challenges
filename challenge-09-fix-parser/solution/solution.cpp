@@ -8,10 +8,29 @@ namespace hftu {
 FixParser::FixParser() {}
 
 void FixParser::build(std::span<const TickerEntry> entries) {
-    symbol_map_.reserve(entries.size());
+    // Size to the next power of two >= 2*N so the table stays <=50% full
+    // (short probe chains). mask_ replaces a modulo on every lookup.
+    size_t cap = 16;
+    while (cap < entries.size() * 2) cap <<= 1;
+    slots_.assign(cap, Slot{});
+    mask_ = cap - 1;
+
     for (const auto& e : entries) {
-        symbol_map_.emplace(std::string(e.symbol), e.value);
+        size_t idx = hash_sv(e.symbol) & mask_;
+        while (slots_[idx].used) idx = (idx + 1) & mask_;   // linear probe
+        slots_[idx].key.assign(e.symbol);
+        slots_[idx].val = e.value;
+        slots_[idx].used = true;
     }
+}
+
+bool FixParser::lookup(std::string_view s, uint32_t& out) const {
+    size_t idx = hash_sv(s) & mask_;
+    while (slots_[idx].used) {
+        if (slots_[idx].key == s) { out = slots_[idx].val; return true; }
+        idx = (idx + 1) & mask_;
+    }
+    return false;
 }
 
 // Parse a fixed-point decimal string like "187.50" into int64_t * 10^8
@@ -89,50 +108,53 @@ static int64_t parse_timestamp(std::string_view s) {
     return total_secs * 1'000'000'000LL + nanos;
 }
 
-static int compute_checksum(const char* data, size_t len) {
-    int sum = 0;
-    for (size_t i = 0; i < len; ++i) {
-        sum += static_cast<unsigned char>(data[i]);
-    }
-    return sum & 0xFF;
-}
-
 void FixParser::parse_batch(std::string_view data, std::vector<ParsedOrder>& out) {
-    size_t pos = 0;
+    const char* const end = data.data() + data.size();
+    const char* p = data.data();
 
-    while (pos < data.size()) {
-        size_t msg_start = pos;
+    while (p < end) {
         ParsedOrder order{};
-
-        // Single forward pass over this message's tags. Tag 10 (checksum) is
-        // always last and marks the end of the message.
-        size_t tpos = pos;
+        unsigned running_cs = 0;   // sum of every byte seen in this message
         bool msg_complete = false;
-        while (tpos < data.size()) {
-            auto eq = data.find('=', tpos);
-            if (eq == std::string_view::npos) break;
-            auto soh = data.find('\x01', eq);
-            if (soh == std::string_view::npos) soh = data.size();
 
-            // Parse tag number
-            int tag = 0;
-            for (size_t i = tpos; i < eq; ++i) {
-                char c = data[i];
-                if (c >= '0' && c <= '9') tag = tag * 10 + (c - '0');
+        // One linear pass over the message. Each iteration consumes exactly
+        // one "tag=value<SOH>" field and folds its bytes into running_cs, so
+        // the checksum falls out for free — no second pass over the bytes.
+        while (p < end) {
+            const unsigned cs_before_field = running_cs;  // checksum excludes tag-10 field
+
+            // --- tag: digits up to '=' (FIX tags are always numeric) ---
+            unsigned tag = 0;
+            char c;
+            while (p < end && (c = *p) != '=') {
+                running_cs += static_cast<unsigned char>(c);
+                tag = tag * 10 + static_cast<unsigned>(c - '0');
+                ++p;
             }
+            if (p == end) break;                       // truncated field
+            running_cs += static_cast<unsigned char>('=');
+            ++p;                                       // skip '='
 
-            std::string_view value = data.substr(eq + 1, soh - eq - 1);
+            // --- value: bytes up to SOH ---
+            // Hottest loop in the parser (runs over every value byte). Well-formed
+            // FIX guarantees an SOH terminator before end-of-buffer, so we trust
+            // that sentinel and drop the redundant `p < end` bounds check — one
+            // fewer branch per byte. (Outer and tag loops stay bounded.)
+            const char* val_start = p;
+            while ((c = *p) != '\x01') {
+                running_cs += static_cast<unsigned char>(c);
+                ++p;
+            }
+            std::string_view value(val_start, static_cast<size_t>(p - val_start));
+            running_cs += static_cast<unsigned char>('\x01');
+            ++p;                                       // consume SOH
 
             if (tag == 10) {
-                // Checksum field: value is the expected checksum; sum of all
-                // bytes before this field ("10=") is the actual checksum.
-                int expected_cs = 0;
-                for (char c : value) {
-                    if (c >= '0' && c <= '9') expected_cs = expected_cs * 10 + (c - '0');
-                }
-                int actual_cs = compute_checksum(data.data() + msg_start, tpos - msg_start);
-                order.valid = (actual_cs == expected_cs);
-                tpos = soh + 1;
+                // Expected checksum is this field's value; actual is the sum of
+                // everything before the "10=" field started.
+                unsigned expected = 0;
+                for (char d : value) expected = expected * 10 + static_cast<unsigned>(d - '0');
+                order.valid = ((cs_before_field & 0xFFu) == expected);
                 msg_complete = true;
                 break;
             }
@@ -140,23 +162,16 @@ void FixParser::parse_batch(std::string_view data, std::vector<ParsedOrder>& out
             switch (tag) {
                 case 35: if (!value.empty()) order.msg_type = value[0]; break;
                 case 54: if (!value.empty()) order.side = static_cast<int8_t>(value[0] - '0'); break;
-                case 55: {
-                    auto it = symbol_map_.find(value);
-                    if (it != symbol_map_.end()) order.symbol_id = it->second;
-                    break;
-                }
+                case 55: lookup(value, order.symbol_id); break;
                 case 52: order.timestamp = parse_timestamp(value); break;
                 case 44: order.price = parse_price(value); break;
                 case 38: order.quantity = parse_int(value); break;
                 default: break;
             }
-
-            tpos = soh + 1;
         }
 
         if (!msg_complete) break;   // no more complete messages
         out.push_back(order);
-        pos = tpos;
     }
 }
 
